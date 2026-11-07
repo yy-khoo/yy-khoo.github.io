@@ -2,6 +2,7 @@
   {
     "listing": "/notes/index.html",
     "items": [
+      "/notes/greek-bump-size/index.html",
       "/notes/european-call-greeks/index.html",
       "/notes/sofr-curve/index.html",
       "/notes/gamma-theta/index.html",
@@ -12,6 +13,7 @@
   {
     "listing": "/index.html",
     "items": [
+      "/notes/greek-bump-size/index.html",
       "/notes/european-call-greeks/index.html",
       "/notes/sofr-curve/index.html",
       "/notes/gamma-theta/index.html",
