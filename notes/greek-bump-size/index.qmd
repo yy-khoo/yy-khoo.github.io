@@ -1,0 +1,204 @@
+---
+title: "How Small Should a Greek Bump Be?"
+date: 2026-11-07
+description: "A numerical experiment with delta, gamma, and the temptation to keep making the bump smaller."
+categories:
+  - Options
+  - Numerical Methods
+  - Model Validation
+jupyter: python3
+code-fold: true
+code-summary: "Show Python"
+execute:
+  enabled: true
+---
+
+When calculating Greeks numerically, we bump the input and reprice. Naturally, a smaller bump should give a better answer. After all, a derivative is what we get when the bump tends to zero. So why not use a very small number and be done with it?
+
+Let's try that with a European call. In the [previous note](../european-call-greeks/index.qmd), I compared numerical Greeks against Black–Scholes at a few fairly comfortable test points. This time, the bump itself is the experiment.
+
+## Start with something we can check
+
+I use the same non-dividend-paying stock, with $K=100$, $r=3\%$, and $\sigma=20\%$. We start at $S=100$ with one year to expiry. All inputs except spot remain fixed when bumping.
+
+For a cash spot bump $h$, the central differences are
+
+$$
+\Delta_h=\frac{C(S+h)-C(S-h)}{2h},\qquad
+\Gamma_h=\frac{C(S+h)-2C(S)+C(S-h)}{h^2}.
+$$
+
+The analytic delta and gamma give us a reference. The pricing code is the same as before, using NumPy's usual double precision. No simulation noise, calibration, or solver tolerance to worry about here. This is deliberately a simple case.
+
+```{python}
+#| label: setup-bump
+#| include: false
+import matplotlib.pyplot as plt
+import numpy as np
+from IPython.display import Markdown, display
+from src.black_scholes import call_price, call_delta, call_gamma
+
+K, r, sigma = 100.0, 0.03, 0.20
+bumps = np.logspace(-8, 1, 241)
+plt.style.use("seaborn-v0_8-whitegrid")
+plt.rcParams.update({"figure.dpi": 120, "axes.spines.top": False,
+                     "axes.spines.right": False, "axes.titleweight": "semibold"})
+
+def numerical_greeks(spot, maturity, bump, strike=K):
+    base = call_price(spot, strike, maturity, r, sigma)
+    up = call_price(spot + bump, strike, maturity, r, sigma)
+    down = call_price(spot - bump, strike, maturity, r, sigma)
+    return (up - down) / (2 * bump), (up - 2 * base + down) / bump**2
+
+def reference_greeks(spot, maturity, strike=K):
+    return (call_delta(spot, strike, maturity, r, sigma),
+            call_gamma(spot, strike, maturity, r, sigma))
+
+def errors(spot, maturity):
+    estimates = numerical_greeks(spot, maturity, bumps)
+    references = reference_greeks(spot, maturity)
+    return [np.abs(a - b) for a, b in zip(estimates, references)]
+
+def error_curve(ax, error, **kwargs):
+    # A plotting floor only: zero measured errors cannot appear on a log axis.
+    ax.loglog(bumps, np.maximum(error, 1e-16), **kwargs)
+    ax.set_xlabel("Cash spot bump, h (smaller to the left)")
+    ax.grid(alpha=0.25, which="both")
+
+# A reasonable bump should agree at the ordinary reference point.
+check = numerical_greeks(100.0, 1.0, 0.1)
+reference = reference_greeks(100.0, 1.0)
+assert abs(check[0] - reference[0]) < 2e-6
+assert abs(check[1] - reference[1]) < 1e-7
+assert all(np.all(np.isfinite(e)) for e in errors(100.0, 1.0))
+```
+
+```{python}
+#| label: tbl-bump-first-look
+#| tbl-cap: "The same call, repriced with progressively smaller cash bumps."
+exact_delta, exact_gamma = reference_greeks(100.0, 1.0)
+rows = ["| Cash bump | Delta | Absolute delta error | Gamma | Absolute gamma error |",
+        "|---:|---:|---:|---:|---:|"]
+for h in (0.1, 0.001, 1e-6, 1e-8):
+    delta, gamma = numerical_greeks(100.0, 1.0, h)
+    rows.append(f"| {h:g} | {float(delta):.8f} | {abs(float(delta-exact_delta)):.2e} | "
+                f"{float(gamma):.8f} | {abs(float(gamma-exact_gamma)):.2e} |")
+display(Markdown("\n".join(rows)))
+```
+
+The small bump does not automatically win. Gamma is particularly unforgiving. To see where things go wrong, let's sweep $h$ from $10^{-8}$ to $10$ instead of picking a few numbers.
+
+## Keep making the bump smaller
+
+```{python}
+#| label: fig-bump-error
+#| fig-cap: "Absolute error against cash bump at S = K = 100 and T = 1 year. Smaller bumps are on the left. Any exactly zero measured errors are drawn at 10⁻¹⁶ for visibility."
+#| fig-width: 9
+#| fig-height: 4
+fig, axes = plt.subplots(1, 2, figsize=(9, 4), layout="constrained")
+for ax, error, name in zip(axes, errors(100.0, 1.0), ("Delta", "Gamma")):
+    error_curve(ax, error, color="#24527a", linewidth=1.4)
+    ax.set(title=name, ylabel=f"Absolute {name.lower()} error")
+plt.show()
+```
+
+Read the charts from right to left. Initially, reducing the bump improves the result. Then the improvement becomes irregular, and eventually the error grows again. There isn't a neat, perfectly smooth bottom to either curve. A single lucky point is not a good basis for choosing the bump.
+
+Two effects are competing here. A large bump measures behaviour over an interval. It misses some of the local detail. For a sufficiently smooth price function, these central differences have leading approximation errors proportional to $h^2$.
+
+At the other end, the computer has to subtract prices that are almost equal. The prices already contain rounding error, and the finite difference amplifies it. Delta divides its price difference by $2h$; gamma divides the residual of three prices by $h^2$. That second calculation can become rather unpleasant as $h$ gets small.
+
+Schematically, the error behaves like
+
+$$
+E_\Delta(h)\sim A h^2+\frac{B\varepsilon}{h},\qquad
+E_\Gamma(h)\sim D h^2+\frac{F\varepsilon}{h^2},
+$$
+
+where $\varepsilon$ represents floating-point precision and the coefficients depend on the price function and its scale. These are error-balance sketches, not formulas for predicting each wiggle in the charts. The analytic reference is also evaluated in floating point, so the smallest measured errors should not be treated as exact error bounds.
+
+## Now try one week to expiry
+
+The earlier risk map showed gamma concentrating near the strike as expiry approaches. Does the same bump still work there? Let's compare one year with one week, at spots of 95, 100, and 105.
+
+```{python}
+#| label: fig-bump-maturity
+#| fig-cap: "The error curves depend on both spot and maturity. Each panel uses absolute error; compare their vertical scales carefully."
+#| fig-width: 9
+#| fig-height: 7
+fig, axes = plt.subplots(2, 2, figsize=(9, 7), layout="constrained")
+colors = ("#24527a", "#bd5c2d", "#34856d")
+for row, (label, maturity) in enumerate((("1 year", 1.0), ("1 week", 1/52))):
+    for spot, color in zip((95.0, 100.0, 105.0), colors):
+        for col, error in enumerate(errors(spot, maturity)):
+            error_curve(axes[row, col], error, color=color, label=f"S = {spot:g}", alpha=0.85)
+    for col, name in enumerate(("Delta", "Gamma")):
+        axes[row, col].set(title=f"{name}: {label}", ylabel="Absolute error")
+        axes[row, col].legend(frameon=False, fontsize=8)
+plt.show()
+```
+
+The useful question is whether there is a region of bumps giving sufficiently accurate results, rather than which individual point has the smallest error. That region changes with the case being measured. Even within one maturity, the curves do not sit on top of each other.
+
+I use absolute error here because relative error can be misleading when the reference Greek is close to zero. For a production check, I would want both an absolute tolerance and a relative tolerance, expressed in the units that matter for the position.
+
+We can also look directly at the short-dated gamma profile. This makes the large-bump problem less abstract.
+
+```{python}
+#| label: fig-bump-gamma-profile
+#| fig-cap: "One-week gamma: a wide bump averages across the peak. This chart isolates the large-bump effect; the error plots above show the separate tiny-bump problem."
+#| fig-width: 8
+#| fig-height: 4.5
+grid = np.linspace(90.0, 110.0, 801)
+fig, ax = plt.subplots(figsize=(8, 4.5), layout="constrained")
+ax.plot(grid, call_gamma(grid, K, 1/52, r, sigma), color="0.15", linewidth=2.3, label="Analytic")
+for h, color in zip((5.0, 1.0, 0.1), colors):
+    _, gamma = numerical_greeks(grid, 1/52, h)
+    ax.plot(grid, gamma, color=color, linestyle="--", label=f"h = {h:g}")
+ax.axvline(K, color="0.5", linewidth=0.8, linestyle=":")
+ax.set(xlabel="Spot", ylabel="Gamma", title="One week to expiry")
+ax.legend(frameon=False)
+plt.show()
+```
+
+A bump of 5 is quite capable of smoothing away the feature we are trying to measure. The calculation runs, the answer looks reasonable, and yet the peak is understated. A smaller bump helps in this example, but the earlier charts tell us not to keep shrinking it indefinitely.
+
+## Cash bump or percentage bump?
+
+So far, $h$ has been a cash amount. A common alternative is to use $h=\eta S$, with $\eta$ being a small fraction of spot. Does that solve the problem?
+
+Let's change the price scale while keeping the options at the money, with one week to expiry. Compare a fixed cash bump of 0.10 against a bump of 0.1% of spot. At $S=100$ these are exactly the same bump.
+
+```{python}
+#| label: tbl-bump-convention
+#| tbl-cap: "Changing the price scale while keeping S/K = 1. Gamma error is relative here because the reference gamma is nonzero in every case."
+rows = ["| Spot = strike | Convention | Cash bump | Absolute delta error | Relative gamma error |",
+        "|---:|:---|---:|---:|---:|"]
+for spot in (20.0, 100.0, 500.0):
+    exact = reference_greeks(spot, 1/52, strike=spot)
+    for label, h in (("Fixed cash", 0.1), ("0.1% of spot", 0.001 * spot)):
+        delta, gamma = numerical_greeks(spot, 1/52, h, strike=spot)
+        rows.append(f"| {spot:g} | {label} | {h:g} | {abs(float(delta-exact[0])):.2e} | "
+                    f"{abs(float((gamma-exact[1])/exact[1])):.3%} |")
+display(Markdown("\n".join(rows)))
+```
+
+A percentage bump handles this change of price scale more consistently. It does not adapt to maturity, however. The characteristic spot width around the strike is roughly $S\sigma\sqrt{T}$, so the same percentage bump occupies more of that region as expiry approaches. Percentage bumping is a useful convention, but it is not a universal accuracy setting. The 0.1% used here is an illustration, not a recommended default.
+
+## What I would check
+
+For this simple example, I would start with the following:
+
+1. Sweep the bump over several orders of magnitude. Look for a stable region, not just the lowest error at one point.
+2. Check delta and gamma separately. A bump that gives an acceptable delta can still give a poor gamma.
+3. Include short maturity and spots around the strike. A comfortable one-year test is not enough.
+4. State the convention and units. A 0.10 cash bump and a 0.1% spot bump are only the same when spot is 100.
+5. Choose against a stated accuracy requirement. Without an analytic reference, stability across bumps is useful evidence, but it is not proof that the pricing model is correct.
+
+The slightly annoying conclusion is that “make it smaller” is not a complete rule. We need a bump small enough to see the local shape, but large enough to leave a price difference that the computer can resolve.
+
+This was the easy case: smooth prices with no sampling noise. What happens when every reprice is itself a Monte Carlo estimate? That sounds like a useful experiment for another day.
+
+### Further reading
+
+The [SciPy numerical differentiation documentation](https://docs.scipy.org/doc/scipy/reference/generated/scipy.differentiate.derivative.html) also discusses step size and subtractive cancellation. This note implements the two central-difference formulas directly; it does not use SciPy's adaptive differentiation routine.
