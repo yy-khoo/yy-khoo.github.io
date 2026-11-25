@@ -1,0 +1,248 @@
+---
+title: "Monte Carlo Greeks: Does a Smaller Bump Still Help?"
+date: 2026-11-26
+description: "Bump-and-reprice delta and gamma with independent draws, common random numbers, and a surprisingly troublesome payoff kink."
+categories:
+  - Options
+  - Numerical Methods
+  - Model Validation
+jupyter: python3
+code-fold: true
+code-summary: "Show Python"
+execute:
+  enabled: true
+---
+
+In the [previous note](../greek-bump-size/index.qmd), making the spot bump smaller eventually made the Greek worse. The problem was floating-point arithmetic. We were subtracting prices that were almost equal, then dividing the residual by a very small number.
+
+This time, let's make life slightly more difficult. What if every price is itself a Monte Carlo estimate?
+
+The formulas for delta and gamma have not changed. But the prices now contain sampling noise. A small bump needs to reveal a price change through that noise, and it turns out the way we generate the random numbers matters quite a bit.
+
+## Same call, different pricing engine
+
+I keep the same European call, with $S=K=100$, $T=1$ year, $r=3\%$, and $\sigma=20\%$. Black–Scholes gives us the reference price and Greeks. Monte Carlo is unnecessary for this particular option, which makes it a useful controlled experiment.
+
+We simulate the terminal stock price directly:
+
+$$
+S_T=S G,\qquad
+G=\exp\left[(r-\tfrac12\sigma^2)T+\sigma\sqrt{T}Z\right],
+\quad Z\sim N(0,1).
+$$
+
+The call estimate is the average discounted payoff, $e^{-rT}(S G-K)^+$. There are no time steps here, so we do not mix time-discretisation error into the experiment.
+
+As before, we use central differences with a cash spot bump $h$:
+
+$$
+\widehat\Delta_h=
+\frac{\widehat C(S+h)-\widehat C(S-h)}{2h},\qquad
+\widehat\Gamma_h=
+\frac{\widehat C(S+h)-2\widehat C(S)+\widehat C(S-h)}{h^2}.
+$$
+
+```{python}
+#| label: setup-mc-greeks
+#| include: false
+import numpy as np
+import matplotlib.pyplot as plt
+from IPython.display import Markdown, display
+from src.black_scholes import call_price, call_delta, call_gamma
+from src.monte_carlo_greeks import (
+    growth_factors, common_greeks, independent_greeks, bump_experiment,
+)
+
+S, K, T, r, sigma = 100.0, 100.0, 1.0, 0.03, 0.20
+bumps = np.logspace(-3, 1, 25)
+counts = (2048, 8192, 32768)
+repeats = 64
+truth = np.array([call_delta(S, K, T, r, sigma),
+                  call_gamma(S, K, T, r, sigma)], dtype=float)
+base = call_price(S, K, T, r, sigma)
+up = call_price(S + bumps, K, T, r, sigma)
+down = call_price(S - bumps, K, T, r, sigma)
+finite_difference = np.column_stack(((up-down)/(2*bumps),
+                                     (up-2*base+down)/bumps**2))
+bias = np.abs(finite_difference - truth)
+
+# Check the stable paired-payoff implementation against direct payoff differences.
+test_growth = np.array([0.8, 0.999, 1.0, 1.001, 1.2])
+h_test = 0.2
+payoff = lambda spot: np.exp(-r*T) * np.maximum(spot*test_growth-K, 0)
+direct = np.array([((payoff(S+h_test)-payoff(S-h_test))/(2*h_test)).mean(),
+                   ((payoff(S+h_test)-2*payoff(S)+payoff(S-h_test))/h_test**2).mean()])
+assert np.allclose(common_greeks(test_growth, S, K, T, r, h_test), direct,
+                   rtol=1e-11, atol=1e-11)
+assert common_greeks(np.array([0.7, 1.3]), S, K, T, r, 0.1)[1] == 0.0
+
+estimates = bump_experiment(bumps, path_counts=counts, repeats=repeats)
+assert np.isfinite(estimates).all()
+rmse = np.sqrt(np.mean((estimates-truth)**2, axis=2))
+standard_deviation = estimates.std(axis=2, ddof=1)
+baseline = counts.index(8192)
+selected = [int(np.argmin(np.abs(bumps-h))) for h in (0.001, 0.1, 1.0)]
+
+# Sampling means should be consistent with the deterministic finite-difference
+# expectation at a moderate bump; this does not test every bump or every seed.
+hi = selected[1]
+mean = estimates[1, baseline, :, hi].mean(axis=0)
+mean_se = standard_deviation[1, baseline, hi] / np.sqrt(repeats)
+assert np.all(np.abs(mean-finite_difference[hi]) < 6*mean_se)
+
+plt.style.use("seaborn-v0_8-whitegrid")
+plt.rcParams.update({"figure.dpi": 120, "axes.spines.top": False,
+                     "axes.spines.right": False, "axes.titleweight": "semibold"})
+colors = ("#24527a", "#bd5c2d", "#34856d")
+```
+
+For each bump, I run **64 independent replications**, first with 8,192 paths per price. The charts report root mean squared error against the analytic Greek:
+
+$$
+\mathrm{RMSE}=\sqrt{\frac{1}{64}\sum_{j=1}^{64}
+\left(\widehat g_j-g_{\mathrm{BS}}\right)^2}.
+$$
+
+This measures sampling variation and finite-difference bias together. It is more informative than showing one seed that happens to look good. It is still an estimate from a finite batch, so small wiggles and the precise minimum should not be overinterpreted.
+
+## First attempt: simulate each price separately
+
+The most straightforward implementation draws new random numbers for each reprice. Generate one group for $S+h$, another for $S-h$, and a third for the base price in gamma. Each group has $N$ paths.
+
+The individual prices may look quite reasonable. Their difference is another matter. With independent price errors, the noise in delta is amplified by $1/h$, and in gamma by $1/h^2$. More precisely, at fixed $N$ and small $h$, their standard deviations scale like $1/(h\sqrt N)$ and $1/(h^2\sqrt N)$, respectively, provided the payoff variances remain finite and nonzero.
+
+Before increasing the number of paths, let's change just one thing: use the **same normal draws for all three spot values**. This is usually called common random numbers. The stock prices still differ; they share the same underlying shocks.
+
+```{python}
+#| label: paired-payoff-example
+# This is the paired calculation for one bump. The experiment repeats it
+# over bumps, path counts, and independent replications.
+rng = np.random.default_rng(42)
+G = growth_factors(rng, 8192, T, r, sigma)
+h = 0.1
+discount = np.exp(-r*T)
+up_payoff = discount * np.maximum((S+h)*G-K, 0)
+base_payoff = discount * np.maximum(S*G-K, 0)
+down_payoff = discount * np.maximum((S-h)*G-K, 0)
+delta = np.mean((up_payoff-down_payoff)/(2*h))
+gamma = np.mean((up_payoff-2*base_payoff+down_payoff)/h**2)
+display(Markdown(f"For this one seed and $h=0.1$: delta **{delta:.6f}**, "
+                 f"gamma **{gamma:.6f}**. These are individual estimates, not the RMSE results below."))
+```
+
+```{python}
+#| label: fig-mc-pairing
+#| fig-cap: "8,192 paths per reprice and 64 replications. The dashed line is the absolute error of central differences computed from Black–Scholes prices: approximation bias plus floating-point rounding, without simulation noise."
+#| fig-width: 9
+#| fig-height: 4.2
+fig, axes = plt.subplots(1, 2, figsize=(9, 4.2), layout="constrained")
+for gi, (ax, name) in enumerate(zip(axes, ("Delta", "Gamma"))):
+    for method, label, color in ((0, "Independent draws", colors[1]),
+                                 (1, "Common random numbers", colors[0])):
+        ax.loglog(bumps, rmse[method, baseline, :, gi], label=label, color=color)
+    ax.loglog(bumps, np.maximum(bias[:, gi], 1e-16), "--", color="0.4", label="Black–Scholes FD error")
+    ax.set(title=name, xlabel="Cash spot bump, h", ylabel="RMSE / absolute error")
+    ax.legend(frameon=False, fontsize=8)
+    ax.grid(alpha=0.25, which="both")
+plt.show()
+```
+
+That is quite a difference for something that does not change the pricing model. The benefit comes from the covariance between reprices: much of the sampling noise cancels in the paired difference.
+
+Both methods still target the same **finite-difference** Greek in expectation, not the exact derivative at a nonzero bump. Common random numbers reduce variance here; they do not remove the approximation bias.
+
+The comparison uses the same $N$ per price. Independent reprices use three independent groups; the paired calculation shares one group and uses an algebraic shortcut for gamma, described below. This is not an equal-wall-clock benchmark. Within each replication I reuse draws across bump sizes and use nested prefixes for different $N$ values. The 64 replications themselves are independent. The root seed is `20261126`.
+
+## Delta gets easier. Gamma still has a problem.
+
+The common-random-number delta settles into a sampling-error region as the bump gets small. It does not keep improving towards zero error: at a fixed path count, we are still averaging a finite sample.
+
+Gamma behaves differently. For a fixed draw $G$, the payoff as a function of spot is $(SG-K)^+$: two straight lines meeting at a kink. If all three bumped spots stay on the same side of that kink, the path contributes zero gamma. Only paths that cross the exercise boundary contribute curvature to the finite difference.
+
+Shrink $h$ and there are fewer such paths. Their individual contributions get larger. In this simple call setup, for small $h$, the crossing probability is of order $h$ and the contributing gamma values are of order $1/h$. The variance of their average therefore grows like $1/(Nh)$. Pairing is a large improvement over independent reprices, but it does not make tiny-bump gamma reliable.
+
+There is an easy trap here. For **one fixed finite sample**, a sufficiently small bump can leave no crossing paths at all. The gamma estimate is then zero, even though the true option gamma is positive. Taking the small-bump limit of that fixed sample is not the same calculation as differentiating the expected payoff.
+
+```{python}
+#| label: fig-mc-gamma-distribution
+#| fig-cap: "Common-random-number gamma across 64 replications, with 8,192 paths each. Each panel has its own horizontal scale. At a tiny bump, many estimates are zero and a few are large; zero is not evidence that the option has no gamma."
+#| fig-width: 9
+#| fig-height: 3.6
+fig, axes = plt.subplots(1, 3, figsize=(9, 3.6), layout="constrained")
+for ax, hi, color in zip(axes, selected, colors):
+    values = estimates[1, baseline, :, hi, 1]
+    ax.hist(values, bins=14, color=color, alpha=0.8)
+    ax.axvline(truth[1], color="0.15", linestyle="--", label="Analytic gamma")
+    ax.set(title=f"h = {bumps[hi]:g}\nZero estimates: {np.count_nonzero(values == 0)}/{repeats}",
+           xlabel="Gamma estimate", ylabel="Replications")
+    ax.legend(frameon=False, fontsize=7)
+plt.show()
+```
+
+For the experiments, I evaluate common-random-number gamma using the equivalent path contribution
+
+$$
+e^{-rT}\frac{\big(hG-|SG-K|\big)^+}{h^2}.
+$$
+
+This is an algebraic rearrangement of the three-payoff difference, not a different estimator. It avoids tiny floating-point residuals on paths whose curvature contribution should be exactly zero. The bump range here is 0.001 to 10; the aim is to investigate sampling error rather than repeat the extreme floating-point experiment from the previous post.
+
+## What if we just add more paths?
+
+Let's repeat the paired calculation with 2,048, 8,192, and 32,768 paths per price.
+
+```{python}
+#| label: fig-mc-path-count
+#| fig-cap: "Common random numbers with increasing path counts. More paths reduce sampling error, while large-bump bias remains. The dashed benchmark includes rounding at the smallest bumps. The curves use 64 replications, so their exact minima are not universal bump recommendations."
+#| fig-width: 9
+#| fig-height: 4.2
+fig, axes = plt.subplots(1, 2, figsize=(9, 4.2), layout="constrained")
+for gi, (ax, name) in enumerate(zip(axes, ("Delta", "Gamma"))):
+    for ni, (count, color) in enumerate(zip(counts, colors)):
+        ax.loglog(bumps, rmse[1, ni, :, gi], color=color, label=f"N = {count:,}")
+    ax.loglog(bumps, np.maximum(bias[:, gi], 1e-16), "--", color="0.4", label="Black–Scholes FD error")
+    ax.set(title=name, xlabel="Cash spot bump, h", ylabel="RMSE / absolute error")
+    ax.legend(frameon=False, fontsize=8)
+    ax.grid(alpha=0.25, which="both")
+plt.show()
+```
+
+At a fixed bump, independent paths give the usual $1/\sqrt N$ scaling of sampling standard deviation. Four times the paths buys roughly half the sampling noise, not four times the accuracy. Once bias dominates, extra paths do little to improve the total error.
+
+The distinction is worth keeping visible. A large bump can produce a stable but biased estimate; a tiny bump can produce a noisy estimate, or a rather convincing zero. Neither is fixed by looking at one seed.
+
+Here is a numerical comparison at a cash bump of 0.10 and 8,192 paths per reprice:
+
+```{python}
+#| label: tbl-mc-greek-summary
+#| tbl-cap: "64 replications at h = 0.10. The standard deviation describes variation between individual Monte Carlo Greek estimates; it is not the standard error of the 64-run average."
+hi = selected[1]
+rows = ["| Greek | Method | Analytic | Mean estimate | Run SD | RMSE |",
+        "|:---|:---|---:|---:|---:|---:|"]
+for gi, name in enumerate(("Delta", "Gamma")):
+    for method, label in ((0, "Independent"), (1, "Common draws")):
+        values = estimates[method, baseline, :, hi, gi]
+        rows.append(f"| {name} | {label} | {truth[gi]:.6f} | {values.mean():.6f} | "
+                    f"{values.std(ddof=1):.3e} | {rmse[method, baseline, hi, gi]:.3e} |")
+display(Markdown("\n".join(rows)))
+```
+
+The three path counts change work approximately in proportion to $N$ for this terminal-payoff calculation. I have not timed competing implementations, and have not added antithetic draws, control variates, or quasi-Monte Carlo. Those would be separate experiments.
+
+## What I would check before trusting the Greek
+
+1. **Pair the shocks across reprices.** For this example, independent simulations make the finite difference unnecessarily noisy. A single shared seed is only useful if the implementation actually preserves that pairing.
+2. **Repeat across independent seeds.** A smooth-looking bump sweep with one fixed sample can hide sampling error. Report dispersion as well as a point estimate.
+3. **Treat delta and gamma separately.** The payoff kink matters much more for the second derivative. A bump that works for delta need not work for gamma.
+4. **Vary both bump and path count.** Look for results that meet a stated accuracy requirement; do not select a universal bump from one observed minimum.
+5. **Use an analytic test case when available.** It lets us separate finite-difference bias from simulation variation before moving to a more complicated payoff.
+
+So, does a smaller bump still help? Sometimes. With independent reprices it quickly amplifies the noise. With paired draws, delta becomes much more manageable, while gamma still needs enough paths close to the exercise boundary.
+
+I started with three price estimates and two familiar formulas. The random-number coupling turned out to be as important as the bump. That is probably the first thing I would check before asking the machine to simulate another million paths.
+
+## Further reading
+
+The [article source](https://github.com/yy-khoo/yy-khoo.github.io/blob/main/notes/monte-carlo-greeks/index.qmd) and [simulation helpers](https://github.com/yy-khoo/yy-khoo.github.io/blob/main/src/monte_carlo_greeks.py) contain the full experiment.
+
+[Broadie and Glasserman (1996), *Estimating Security Price Derivatives Using Simulation*](https://www.columbia.edu/~mnb2/broadie/Assets/bg-ms-1996.pdf), discusses re-simulation, common random numbers, and direct Greek estimators. This note stays with central bump-and-reprice; it does not implement the paper's pathwise or likelihood-ratio methods.
